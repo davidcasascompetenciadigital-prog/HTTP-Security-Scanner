@@ -1,0 +1,20 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Bytecode y herramientas de Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+
+# Base de datos local de CVEs (feed de ~100 MB, se regenera con la opción 9)
+cve_cache/
+
+# Reportes generados por el escáner
+report_*.json
+
+# Variables de entorno (API keys)
+.env

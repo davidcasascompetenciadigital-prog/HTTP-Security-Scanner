@@ -12,6 +12,7 @@ import time
 import json
 import os
 from datetime import datetime, timedelta
+from decimal import Decimal
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlencode
 import re
@@ -27,6 +28,9 @@ class NVDAPI:
     """
     
     BASE_URL = "https://services.nvd.nist.gov/rest/json/cves/2.0"
+    MAX_WINDOW_DAYS = 120      # la API rechaza con 404 cualquier rango mayor
+    MAX_RESULTS_PER_PAGE = 2000
+    MAX_RETRIES = 3
     
     def __init__(self, api_key: str = None):
         """
@@ -55,6 +59,7 @@ class NVDAPI:
             print("   💡 Registra una API key gratis en: https://nvd.nist.gov/developers/request-an-api-key")
         
         self.last_request = 0
+        self.request_count = 0
     
     def set_api_key(self, api_key: str):
         """Permite configurar la API key después de la inicialización"""
@@ -76,51 +81,134 @@ class NVDAPI:
         if elapsed < self.rate_limit:
             time.sleep(self.rate_limit - elapsed)
         self.last_request = time.time()
+        self.request_count += 1
     
-    def _build_cpe_query(self, technology: str, version: str = None) -> str:
+    @staticmethod
+    def _clean_version(version: str):
+        """
+        Extrae la versión numérica de un banner tipo '7.4.3-1' o '1.24.0 (Ubuntu)'.
+        Devuelve None si no hay una versión utilizable.
+        """
+        if not version:
+            return None
+        match = re.match(r'^[vV]?(\d+(?:\.\d+)*)', str(version).strip())
+        return match.group(1) if match else None
+    
+    def _build_cpe_query(self, technology: str, version: str = None) -> Optional[str]:
         """
         Construye una consulta CPE para la búsqueda en NVD
-        Formato: cpe:2.3:vendor:product:version:*:*:*:*:*:*:*
+        
+        Formato: cpe:2.3:a:vendor:product:version:*:*:*:*:*:*:*
+        
+        La API de NVD rechaza con HTTP 404 cualquier CPE con comodín en la
+        versión, por lo que sin versión no se puede consultar por CPE.
         """
         tech_lower = technology.lower()
+        version_clean = self._clean_version(version)
         
-        # Mapeo de tecnologías a sus vendors comunes en CPE
-        vendor_map = {
-            'nginx': 'f5',
-            'apache': 'apache',
-            'wordpress': 'wordpress',
-            'php': 'php',
-            'mysql': 'mysql',
-            'postgresql': 'postgresql',
-            'openssl': 'openssl',
-            'python': 'python',
-            'nodejs': 'nodejs',
-            'django': 'djangoproject',
-            'odoo': 'odoo',
-            'rails': 'rubyonrails',
-            'express': 'expressjs',
-            'jquery': 'jquery',
-            'bootstrap': 'twbs',
-            'react': 'facebook',
-            'angular': 'google',
-            'vuejs': 'vuejs',
-            'tomcat': 'apache',
-            'iis': 'microsoft',
-            'caddy': 'caddyserver',
-            'gunicorn': 'gunicorn',
-            'uwsgi': 'unbit'
+        if not version_clean:
+            return None
+        
+        # Mapeo de tecnologías a sus vendor/product reales en CPE
+        cpe_map = {
+            'nginx': ('f5', 'nginx'),
+            'apache': ('apache', 'http_server'),
+            'httpd': ('apache', 'http_server'),
+            'wordpress': ('wordpress', 'wordpress'),
+            'php': ('php', 'php'),
+            'mysql': ('oracle', 'mysql'),
+            'mariadb': ('mariadb', 'mariadb'),
+            'postgresql': ('postgresql', 'postgresql'),
+            'openssl': ('openssl', 'openssl'),
+            'python': ('python', 'python'),
+            'nodejs': ('nodejs', 'node.js'),
+            'node': ('nodejs', 'node.js'),
+            'django': ('djangoproject', 'django'),
+            'odoo': ('odoo', 'odoo'),
+            'joomla': ('joomla', 'joomla'),
+            'drupal': ('drupal', 'drupal'),
+            'rails': ('rubyonrails', 'rails'),
+            'rubyonrails': ('rubyonrails', 'rails'),
+            'express': ('expressjs', 'express'),
+            'jquery': ('jquery', 'jquery'),
+            'bootstrap': ('twbs', 'bootstrap'),
+            'react': ('facebook', 'react'),
+            'angular': ('angular', 'angular'),
+            'vuejs': ('vuejs', 'vue.js'),
+            'tomcat': ('apache', 'tomcat'),
+            'iis': ('microsoft', 'internet_information_services'),
+            'caddy': ('caddyserver', 'caddy'),
+            'jetty': ('eclipse', 'jetty'),
+            'gunicorn': ('gunicorn', 'gunicorn'),
+            'uwsgi': ('unbit', 'uwsgi'),
         }
         
-        vendor = vendor_map.get(tech_lower, tech_lower)
-        product = tech_lower
+        vendor, product = cpe_map.get(tech_lower, (tech_lower, tech_lower))
+        return f"cpe:2.3:a:{vendor}:{product}:{version_clean}:*:*:*:*:*:*:*"
+    
+    @staticmethod
+    def _date_windows(days_back: int, max_days: int = None):
+        """
+        Genera ventanas (inicio, fin) de como máximo MAX_WINDOW_DAYS días.
+        La API de NVD devuelve 404 si el rango supera 120 días.
+        """
+        max_days = max_days or NVDAPI.MAX_WINDOW_DAYS
+        end = datetime.now()
+        start = end - timedelta(days=days_back)
+        windows = []
+        while start < end:
+            window_end = min(start + timedelta(days=max_days), end)
+            windows.append((start, window_end))
+            start = window_end
+        return windows
+    
+    @staticmethod
+    def _format_date(dt: datetime) -> str:
+        """NVD exige el formato yyyy-MM-dd'T'HH:mm:ss.SSS"""
+        return dt.strftime('%Y-%m-%dT%H:%M:%S.000')
+    
+    def _get(self, params: dict):
+        """
+        Realiza una petición GET aplicando rate limit y reintentos acotados.
+        Devuelve (response, None) o (None, mensaje de error).
+        """
+        for attempt in range(self.MAX_RETRIES):
+            self._wait_for_rate_limit()
+            
+            try:
+                response = self.session.get(self.BASE_URL, params=params, timeout=45)
+            except requests.exceptions.Timeout:
+                print("      ❌ Timeout en la petición a NVD")
+                time.sleep(2 * (attempt + 1))
+                continue
+            except requests.exceptions.RequestException as e:
+                print(f"      ❌ Error de red: {e}")
+                time.sleep(2 * (attempt + 1))
+                continue
+            
+            if response.status_code == 200:
+                return response, None
+            
+            # 403/429: límite alcanzado. Backoff acotado (nunca recursión infinita)
+            if response.status_code in (403, 429):
+                retry_after = response.headers.get('Retry-After')
+                if retry_after and retry_after.isdigit():
+                    wait = int(retry_after)
+                else:
+                    wait = int(30 * (attempt + 1))
+                wait = min(wait, 120)
+                if attempt < self.MAX_RETRIES - 1:
+                    print(f"      ⚠️  Límite de API alcanzado. Reintento {attempt + 1}/{self.MAX_RETRIES} en {wait}s...")
+                    time.sleep(wait)
+                    continue
+                return None, "Límite de peticiones alcanzado (403/429)"
+            
+            if response.status_code == 404:
+                return None, "404 (CPE o rango de fechas no válido)"
+            
+            return None, f"HTTP {response.status_code}: {response.text[:150]}"
         
-        if version and version != 'unknown' and version != 'Unknown' and version != '':
-            version_clean = version.split()[0].strip()
-            version_clean = re.sub(r'[^0-9.]', '', version_clean)
-            if version_clean and version_clean != '':
-                return f"cpe:2.3:*:{vendor}:{product}:{version_clean}:*:*:*:*:*:*:*"
-        
-        return f"cpe:2.3:*:{vendor}:{product}:*:*:*:*:*:*:*"
+        return None, "Se agotaron los reintentos"
     
     def search_cves(self, technology: str, version: str = None, 
                    max_results: int = 50, days_back: int = 730) -> List[Dict]:
@@ -129,7 +217,8 @@ class NVDAPI:
         
         Args:
             technology: Nombre de la tecnología (ej. nginx, wordpress, php)
-            version: Versión específica (opcional)
+            version: Versión específica (opcional). Sin versión se usa
+                     búsqueda por keyword, menos precisa.
             max_results: Máximo de resultados a devolver
             days_back: Días hacia atrás para buscar (default: 730 días = 2 años)
             
@@ -140,72 +229,67 @@ class NVDAPI:
         print(f"\n   🔍 Buscando {tech_display} en NVD API...")
         
         cpe_query = self._build_cpe_query(technology, version)
-        print(f"      📌 CPE: {cpe_query}")
         
-        params = {
-            'cpeName': cpe_query,
-            'resultsPerPage': min(max_results, 2000),
-            'startIndex': 0
-        }
+        if cpe_query:
+            print(f"      📌 CPE: {cpe_query}")
+        else:
+            print(f"      📌 Sin versión utilizable: se usará búsqueda por palabra clave")
         
-        if days_back:
-            start_date = (datetime.now() - timedelta(days=days_back)).isoformat()
-            params['pubStartDate'] = start_date
-            
         results = []
+        seen_ids = set()
+        windows = self._date_windows(days_back)
         
-        try:
-            self._wait_for_rate_limit()
+        for start, end in windows:
+            params = {
+                'resultsPerPage': min(max_results, self.MAX_RESULTS_PER_PAGE),
+                'startIndex': 0,
+                'pubStartDate': self._format_date(start),
+                'pubEndDate': self._format_date(end)
+            }
             
-            print(f"      ⏳ Consultando NVD...")
-            response = self.session.get(
-                self.BASE_URL,
-                params=params,
-                timeout=30
-            )
-            
-            if response.status_code == 200:
-                data = response.json()
-                vulnerabilities = data.get('vulnerabilities', [])
-                
-                total_results = data.get('totalResults', 0)
-                print(f"      📊 Total encontrados en NVD: {total_results}")
-                
-                if total_results == 0:
-                    print(f"      ℹ️  No se encontraron CVEs para {tech_display}")
-                    return []
-                
-                for vuln in vulnerabilities:
-                    cve_data = vuln.get('cve', {})
-                    cve_info = self._extract_cve_info(cve_data)
-                    results.append(cve_info)
-                    
-                    if len(results) >= max_results:
-                        break
-                
-                print(f"      ✅ Devueltos: {len(results)} CVEs")
-                
-            elif response.status_code == 404:
-                print(f"      ⚠️  CPE no encontrado en NVD")
-                if version:
-                    print(f"      🔄 Reintentando sin versión...")
-                    return self.search_cves(technology, None, max_results, days_back)
-                return []
-                
-            elif response.status_code == 403:
-                print(f"      ⚠️  Límite de API alcanzado. Esperando 60 segundos...")
-                time.sleep(60)
-                return self.search_cves(technology, version, max_results, days_back)
+            if cpe_query:
+                params['cpeName'] = cpe_query
             else:
-                print(f"      ❌ Error: {response.status_code}")
-                if response.text:
-                    print(f"      {response.text[:200]}")
-                
-        except requests.exceptions.Timeout:
-            print("      ❌ Timeout en la petición a NVD")
-        except Exception as e:
-            print(f"      ❌ Error: {e}")
+                params['keywordSearch'] = technology
+                params['keywordExactMatch'] = 'true'
             
+            print(f"      ⏳ Ventana {start.strftime('%Y-%m-%d')} → {end.strftime('%Y-%m-%d')} ({len(windows)} en total)")
+            response, error = self._get(params)
+            
+            if error:
+                print(f"      ❌ {error}")
+                # Un 404 con keyword puede ser normal: seguir con el resto de ventanas
+                if error.startswith('404'):
+                    continue
+                break
+            
+            data = response.json()
+            vulnerabilities = data.get('vulnerabilities', [])
+            total_results = data.get('totalResults', 0)
+            
+            for vuln in vulnerabilities:
+                cve_data = vuln.get('cve', {})
+                cve_info = self._extract_cve_info(cve_data)
+                cve_id = cve_info.get('id')
+                if cve_id and cve_id in seen_ids:
+                    continue
+                if cve_id:
+                    seen_ids.add(cve_id)
+                results.append(cve_info)
+            
+            if total_results:
+                print(f"      📊 {len(results)} CVE(s) acumulado(s) (total en la ventana: {total_results})")
+            
+            if len(results) >= max_results:
+                break
+        
+        results = results[:max_results]
+        
+        if results:
+            print(f"      ✅ Devueltos: {len(results)} CVEs")
+        else:
+            print(f"      ℹ️  No se encontraron CVEs para {tech_display}")
+        
         return results
     
     def _extract_cve_info(self, cve_data: Dict) -> Dict:
@@ -218,27 +302,7 @@ class NVDAPI:
                 description = desc.get('value', '')
                 break
         
-        severity = {'score': 'N/A', 'severity': 'UNKNOWN', 'vector': 'N/A'}
-        metrics = cve_data.get('metrics', {})
-        
-        if 'cvssMetricV31' in metrics:
-            metric = metrics['cvssMetricV31'][0]
-            if 'cvssData' in metric:
-                cvss = metric['cvssData']
-                severity['score'] = cvss.get('baseScore', 'N/A')
-                severity['severity'] = metric.get('baseSeverity', 'UNKNOWN')
-                severity['vector'] = cvss.get('vectorString', 'N/A')
-        elif 'cvssMetricV30' in metrics:
-            metric = metrics['cvssMetricV30'][0]
-            if 'cvssData' in metric:
-                cvss = metric['cvssData']
-                severity['score'] = cvss.get('baseScore', 'N/A')
-                severity['severity'] = metric.get('baseSeverity', 'UNKNOWN')
-                severity['vector'] = cvss.get('vectorString', 'N/A')
-        elif 'cvssMetricV2' in metrics:
-            metric = metrics['cvssMetricV2'][0]
-            severity['score'] = metric.get('baseScore', 'N/A')
-            severity['severity'] = metric.get('severity', 'UNKNOWN')
+        severity = self._extract_severity(cve_data.get('metrics', {}))
         
         return {
             'id': cve_id,
@@ -249,7 +313,59 @@ class NVDAPI:
             'vulnStatus': cve_data.get('vulnStatus', '')
         }
     
-    def search_cves_for_site(self, technologies: List[Tuple[str, str]]) -> Dict[str, List[Dict]]:
+    @staticmethod
+    def _extract_severity(metrics: Dict) -> Dict:
+        """
+        Extrae la severidad de las métricas CVSS.
+
+        Ojo: en CVSS v3.x baseSeverity vive dentro de cvssData, mientras que
+        en v2 está en el nivel de la métrica. El score siempre está en
+        cvssData.baseScore.
+        """
+        severity = {
+            'score': 'N/A',
+            'severity': 'UNKNOWN',
+            'vector': 'N/A',
+            'version': 'N/A'
+        }
+        
+        for key, version in (('cvssMetricV40', '4.0'), ('cvssMetricV31', '3.1'),
+                             ('cvssMetricV30', '3.0'), ('cvssMetricV2', '2.0')):
+            entries = metrics.get(key)
+            if not entries:
+                continue
+            
+            metric = entries[0]
+            cvss = metric.get('cvssData', {})
+            
+            score = cvss.get('baseScore', metric.get('baseScore'))
+            if isinstance(score, (int, float, Decimal)):
+                score = float(score)
+            else:
+                score = 'N/A'
+            
+            severity['score'] = score
+            severity['vector'] = cvss.get('vectorString', 'N/A')
+            severity['version'] = version
+            # v3.x: dentro de cvssData / v2: en el nivel de la métrica
+            severity['severity'] = cvss.get('baseSeverity') or metric.get('baseSeverity', 'UNKNOWN')
+            
+            # Si no vino la severidad, derivarla del score (umbrales CVSS)
+            if severity['severity'] == 'UNKNOWN' and isinstance(score, float):
+                if score >= 9.0:
+                    severity['severity'] = 'CRITICAL'
+                elif score >= 7.0:
+                    severity['severity'] = 'HIGH'
+                elif score >= 4.0:
+                    severity['severity'] = 'MEDIUM'
+                else:
+                    severity['severity'] = 'LOW'
+            break
+        
+        return severity
+    
+    def search_cves_for_site(self, technologies: List[Tuple[str, str]], 
+                             days_back: int = 730) -> Dict[str, List[Dict]]:
         """Busca CVEs para múltiples tecnologías"""
         results = {}
         total_tech = len(technologies)
@@ -267,11 +383,12 @@ class NVDAPI:
             print(f"\n   📌 [{current}/{total_tech}] {tech} {version}")
             print("   " + "-" * 50)
             
-            cves = self.search_cves(tech, version, max_results=50, days_back=730)
+            cves = self.search_cves(tech, version, max_results=50, days_back=days_back)
             
-            if not cves and version and version != 'unknown':
-                print(f"      🔄 Reintentando sin versión específica...")
-                cves = self.search_cves(tech, None, max_results=50, days_back=730)
+            # Si no hay resultados y la búsqueda CPE no yielded nada,
+            # reintentar por palabra clave (menos precisa pero más cobertura)
+            if not cves and version and self._clean_version(version):
+                cves = self.search_cves(tech, None, max_results=50, days_back=days_back)
             
             results[f"{tech} {version}"] = {
                 'count': len(cves),
@@ -290,13 +407,10 @@ class NVDAPI:
                 print(f"\n   ℹ️ {tech} {version}: 0 CVEs encontrados")
                 print(f"      💡 Sugerencia: Prueba con la base de datos FKIE-CAD (opción 5)")
             
-            if current < total_tech:
-                wait_time = self.rate_limit
-                print(f"\n   ⏳ Esperando {wait_time:.1f}s para respetar rate limit...")
-                time.sleep(wait_time)
-        
+            # El rate limit ya se aplica dentro de search_cves vía _wait_for_rate_limit
+            
         print("\n" + "=" * 70)
-        print("✅ BÚSQUEDA COMPLETADA")
+        print(f"✅ BÚSQUEDA COMPLETADA ({self.request_count} peticiones a NVD)")
         print("=" * 70)
         
         return results

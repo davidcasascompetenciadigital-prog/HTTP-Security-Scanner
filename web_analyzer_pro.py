@@ -17,12 +17,14 @@ from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
+from requests.structures import CaseInsensitiveDict
 import warnings
 warnings.filterwarnings('ignore')
 
 # Importar módulos de CVEs
 from cve_analyzer import LocalCVEDatabase
 from nvd_api import NVDAPI
+from http_utils import is_httponly, get_samesite
 
 # Librerías para interfaz visual
 try:
@@ -336,7 +338,9 @@ https://nvd.nist.gov/[/italic dim]
 
     def analyze_headers(self, response):
         """Analiza las cabeceras HTTP"""
-        self.headers = dict(response.headers)
+        # CaseInsensitiveDict: las cabeceras reales llegan como 'Server', 'X-Powered-By', etc.
+        # y todas las comprobaciones usan clave minúscula
+        self.headers = CaseInsensitiveDict(response.headers)
 
         self.classified_headers = defaultdict(list)
         categories = {
@@ -436,12 +440,19 @@ https://nvd.nist.gov/[/italic dim]
                         'description': f'Cookie {cookie.name} no tiene flag Secure',
                         'remediation': 'Agregar flag Secure a la cookie'
                     })
-                if not cookie.has_nonstandard_attr('httponly'):
+                if not is_httponly(cookie):
                     self.vulnerabilities.append({
                         'type': f'Cookie {cookie.name} sin HttpOnly',
                         'severity': 'Media',
                         'description': f'Cookie {cookie.name} accesible por JavaScript',
                         'remediation': 'Agregar flag HttpOnly a la cookie'
+                    })
+                if get_samesite(cookie) == 'None':
+                    self.vulnerabilities.append({
+                        'type': f'Cookie {cookie.name} sin SameSite',
+                        'severity': 'Baja',
+                        'description': f'Cookie {cookie.name} sin atributo SameSite',
+                        'remediation': 'Agregar SameSite=Lax o SameSite=Strict a la cookie'
                     })
 
     # =====================================================
@@ -622,27 +633,13 @@ https://nvd.nist.gov/[/italic dim]
                 input("\n[dim]Presiona Enter para continuar...[/dim]")
                 return
 
-        self.cve_results = {}
-        total_tech = len(self.technologies)
-        current = 0
-
+        # Una sola pasada sobre el feed para todas las tecnologías
         console.print("\n[bold green]🔍 Buscando CVEs con FKIE-CAD...[/bold green]")
 
-        for tech, version in self.technologies:
-            current += 1
-            console.print(f"   [yellow]⌛ [{current}/{total_tech}] Revisando {tech} {version}...[/yellow]")
-            
-            with console.status(f"[bold green]   Buscando CVEs para {tech} {version}...[/bold green]"):
-                cves = self.cve_db.search_cves_by_technology(tech, version)
-                self.cve_results[f"{tech} {version}"] = {
-                    'count': len(cves),
-                    'cves': cves
-                }
-            
-            if len(cves) > 0:
-                console.print(f"   [green]✅ {tech} {version}: {len(cves)} CVEs encontrados[/green]")
-            else:
-                console.print(f"   [dim]ℹ️ {tech} {version}: 0 CVEs encontrados[/dim]")
+        with console.status("[bold green]   Analizando la base de datos de CVEs...[/bold green]"):
+            self.cve_results = self.cve_db.search_cves_for_technologies(
+                self.technologies, max_results_per_tech=50
+            )
 
         self.last_source = 'FKIE-CAD'
         self.cves_searched = True
@@ -1352,17 +1349,21 @@ https://nvd.nist.gov/[/italic dim]
         cookie_table.add_column("Valor", style="white")
         cookie_table.add_column("Secure", style="bold")
         cookie_table.add_column("HttpOnly", style="bold")
+        cookie_table.add_column("SameSite", style="bold")
         cookie_table.add_column("Dominio", style="dim")
         cookie_table.add_column("Ruta", style="dim")
 
         for cookie in self.response.cookies:
             secure = "✅" if cookie.secure else "❌"
-            httponly = "✅" if cookie.has_nonstandard_attr('httponly') else "❌"
+            httponly = "✅" if is_httponly(cookie) else "❌"
+            samesite = get_samesite(cookie)
+            samesite_text = "❌" if samesite == 'None' else samesite
             cookie_table.add_row(
                 cookie.name,
                 cookie.value[:30] + ("..." if len(cookie.value) > 30 else ""),
                 secure,
                 httponly,
+                samesite_text,
                 cookie.domain or "-",
                 cookie.path or "/"
             )
@@ -1370,7 +1371,8 @@ https://nvd.nist.gov/[/italic dim]
         console.print(cookie_table)
 
         secure_count = sum(1 for c in self.response.cookies if c.secure)
-        httponly_count = sum(1 for c in self.response.cookies if c.has_nonstandard_attr('httponly'))
+        httponly_count = sum(1 for c in self.response.cookies if is_httponly(c))
+        samesite_count = sum(1 for c in self.response.cookies if get_samesite(c) != 'None')
         total = len(self.response.cookies)
 
         if total > 0:
@@ -1379,6 +1381,7 @@ https://nvd.nist.gov/[/italic dim]
 • Cookies totales: {total}
 • Con Secure: {secure_count}/{total} ({secure_count/total*100:.1f}%)
 • Con HttpOnly: {httponly_count}/{total} ({httponly_count/total*100:.1f}%)
+• Con SameSite: {samesite_count}/{total} ({samesite_count/total*100:.1f}%)
             """
             console.print(Panel(summary, border_style="yellow"))
 

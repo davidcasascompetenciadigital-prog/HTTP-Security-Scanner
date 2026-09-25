@@ -14,13 +14,16 @@ from collections import defaultdict
 from typing import Dict, List, Set, Optional, Tuple
 from datetime import datetime
 
+from http_utils import is_httponly, get_samesite
+
 class WebAnalyzerAdvanced:
     """Analizador avanzado de recursos web"""
     
     def __init__(self, url: str, html: str, headers: Dict, cookies: List):
         self.url = url
         self.html = html
-        self.headers = headers
+        # Normalizar a minúsculas: las cabeceras reales llegan como 'Server', 'Content-Type', etc.
+        self.headers = {k.lower(): v for k, v in headers.items()}
         self.cookies = cookies
         self.domain = urlparse(url).netloc
         
@@ -220,8 +223,8 @@ class WebAnalyzerAdvanced:
                     'domain': cookie.domain or self.domain,
                     'path': cookie.path or '/',
                     'secure': cookie.secure,
-                    'httponly': cookie.has_nonstandard_attr('httponly'),
-                    'samesite': cookie.get_nonstandard_attr('samesite', 'None'),
+                    'httponly': is_httponly(cookie),
+                    'samesite': get_samesite(cookie),
                     'expires': cookie.expires if hasattr(cookie, 'expires') else None,
                     'type': self._classify_cookie(cookie)
                 }

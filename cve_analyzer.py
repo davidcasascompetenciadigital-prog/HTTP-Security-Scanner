@@ -17,6 +17,8 @@ from typing import Dict, List, Optional, Tuple
 import gc
 import re
 
+from nvd_api import NVDAPI
+
 try:
     import ijson
     IJSON_AVAILABLE = True
@@ -33,7 +35,8 @@ class LocalCVEDatabase:
     """Gestor de base de datos local de CVEs - Con soporte de rangos de versión"""
 
     BASE_URL = "https://github.com/fkie-cad/nvd-json-data-feeds/releases/latest/download/"
-    ALL_CVES_FILE = "CVE-All.json.xz"
+    # Ojo: el asset se llama 'CVE-all.json.xz' con 'all' en minúscula
+    ALL_CVES_FILE = "CVE-all.json.xz"
     METADATA_URL = "https://api.github.com/repos/fkie-cad/nvd-json-data-feeds/releases/latest"
 
     def __init__(self, cache_dir: str = "./cve_cache"):
@@ -207,91 +210,123 @@ class LocalCVEDatabase:
         """
         Busca CVEs usando ijson - Con soporte de rangos de versión
         """
+        results = self.search_cves_for_technologies(
+            [(technology, version)], max_results_per_tech=max_results
+        )
+        return results.get(f"{technology} {version}", {}).get('cves', [])
+
+    @staticmethod
+    def _technology_matches(criteria: str, tech_lower: str) -> bool:
+        """
+        Indica si un criterio CPE corresponde a la tecnología buscada.
+
+        Se compara con el vendor y el product del CPE, no con la cadena
+        completa: 'apache' como vendor (p.ej. tomcat) también debe contar.
+        """
+        parts = criteria.split(':')
+        if len(parts) < 6:
+            return False
+        vendor, product = parts[3], parts[4]
+        return tech_lower in (vendor, product)
+
+    def search_cves_for_technologies(self, technologies: List[Tuple[str, str]],
+                                    max_results_per_tech: int = 50) -> Dict[str, Dict]:
+        """
+        Busca CVEs para varias tecnologías en una sola pasada sobre el feed.
+
+        Comprimir y descomprimir el .xz es la operación cara: hacerlo una vez
+        por tecnología multiplicaba el tiempo por N.
+        """
         if not self.cves_file.exists():
             print("⚠️  Base de datos no descargada")
-            return []
+            return {}
 
-        results = []
-        tech_lower = technology.lower()
-        version_str = version if version else None
+        results = {f"{tech} {version}": {'count': 0, 'cves': []}
+                   for tech, version in technologies}
+        versions = {f"{tech} {version}": version for tech, version in technologies}
+        tech_names = {f"{tech} {version}": tech.lower() for tech, version in technologies}
 
-        print(f"   🔍 Buscando {technology} {version if version else '(todas)'}...")
+        print(f"   🔍 Buscando en la base de datos local "
+              f"({len(technologies)} tecnología(s), una sola pasada)...")
 
         try:
             with lzma.open(self.cves_file, 'rb') as f:
-                cves_iterator = ijson.items(f, 'cve_items.item')
-                
+                # use_float: ijson devuelve Decimal por defecto, que no es
+                # serializable a JSON ni comparable con float
+                cves_iterator = ijson.items(f, 'cve_items.item', use_float=True)
+
                 processed = 0
-                found = 0
-                
+
                 for cve_data in cves_iterator:
                     processed += 1
-                    
-                    # Buscar en configurations
-                    configs = cve_data.get('configurations', [])
-                    found_match = False
-                    
-                    for config in configs:
-                        if found_match:
-                            break
-                        for node in config.get('nodes', []):
-                            if found_match:
-                                break
-                            for cpe_match in node.get('cpeMatch', []):
-                                # FKIE-CAD usa 'criteria' en lugar de 'cpe23Uri'
-                                criteria = cpe_match.get('criteria', '').lower()
-                                
-                                if tech_lower in criteria:
-                                    # Si no hay versión específica, encontrado
-                                    if not version_str:
-                                        found_match = True
-                                        break
-                                    
-                                    # Verificar rangos de versión
-                                    version_start = cpe_match.get('versionStartIncluding', '')
-                                    version_end = cpe_match.get('versionEndExcluding', '')
-                                    
-                                    if self._version_in_range(version_str, version_start, version_end):
-                                        found_match = True
-                                        break
-                                    
-                                    # También verificar si la versión está en el CPE
-                                    parts = criteria.split(':')
-                                    if len(parts) > 4:
-                                        cpe_version = parts[4]
-                                        if version_str in cpe_version or cpe_version in version_str:
-                                            found_match = True
-                                            break
-                            if found_match:
-                                break
-                        if found_match:
-                            break
-                    
-                    if found_match:
-                        cve_info = self._extract_cve_info(cve_data)
-                        results.append(cve_info)
-                        found += 1
-                        if found >= max_results:
-                            break
-                    
-                    if processed % 1000 == 0:
-                        print(f"\r   Procesados: {processed} CVEs | Encontrados: {found}", end='')
-                    
-                    # Limitar a 50,000 CVEs
-                    if processed >= 50000:
-                        print(f"\r   ⚠️  Límite de 50,000 CVEs alcanzado", end='')
-                        break
 
-            print(f"\r   ✅ Procesados: {processed} CVEs | Encontrados: {found}   ")
+                    configs = cve_data.get('configurations', [])
+
+                    for key, tech_lower in tech_names.items():
+                        bucket = results[key]
+                        if len(bucket['cves']) >= max_results_per_tech:
+                            continue
+
+                        version_str = versions[key]
+                        if not self._cve_matches(cve_data, configs, tech_lower, version_str):
+                            continue
+
+                        bucket['cves'].append(self._extract_cve_info(cve_data))
+
+                    if processed % 5000 == 0:
+                        print(f"\r   Procesados: {processed:,} CVEs", end='')
+
+            print(f"\r   ✅ Procesados: {processed:,} CVEs              ")
 
         except MemoryError:
             print("   ❌ Error: Memoria insuficiente")
-            return []
+            return {}
         except Exception as e:
             print(f"   ❌ Error buscando CVEs: {e}")
-            return []
+            return {}
+
+        for key, bucket in results.items():
+            bucket['count'] = len(bucket['cves'])
+
+        for key, bucket in results.items():
+            if bucket['count'] > 0:
+                print(f"   ✅ {key}: {bucket['count']} CVEs")
+            else:
+                print(f"   ℹ️  {key}: 0 CVEs")
 
         return results
+
+    def _cve_matches(self, cve_data: Dict, configs: List[Dict],
+                     tech_lower: str, version_str: str) -> bool:
+        """Comprueba si un CVE aplica a la tecnología (y versión) dada"""
+        for config in configs:
+            for node in config.get('nodes', []):
+                for cpe_match in node.get('cpeMatch', []):
+                    if not cpe_match.get('vulnerable', True):
+                        continue
+
+                    # FKIE-CAD usa 'criteria' en lugar de 'cpe23Uri'
+                    criteria = cpe_match.get('criteria', '').lower()
+                    if not criteria or not self._technology_matches(criteria, tech_lower):
+                        continue
+
+                    # Sin versión específica: basta con que el producto coincida
+                    if not version_str:
+                        return True
+
+                    # Verificar rangos de versión
+                    version_start = cpe_match.get('versionStartIncluding', '')
+                    version_end = cpe_match.get('versionEndExcluding', '')
+                    if self._version_in_range(version_str, version_start, version_end):
+                        return True
+
+                    # También comprobar la versión exacta del CPE.
+                    # Comparación por subcadena: "1.2" casaba con "1.20.1"
+                    parts = criteria.split(':')
+                    if len(parts) > 4 and parts[4] == version_str:
+                        return True
+
+        return False
 
     def _extract_cve_info(self, cve_data: Dict) -> Dict:
         """Extrae información de un CVE"""
@@ -314,45 +349,10 @@ class LocalCVEDatabase:
 
     def _get_severity(self, cve_data: Dict) -> Dict:
         """Extrae severidad de los datos del CVE"""
-        severity = {
-            'score': 'N/A',
-            'severity': 'UNKNOWN',
-            'vector': 'N/A'
-        }
-        
-        metrics = cve_data.get('metrics', {})
-        if 'cvssMetricV31' in metrics:
-            metric = metrics['cvssMetricV31'][0]
-            if 'cvssData' in metric:
-                cvss = metric['cvssData']
-                severity['score'] = cvss.get('baseScore', 'N/A')
-                severity['severity'] = metric.get('baseSeverity', 'UNKNOWN')
-                severity['vector'] = cvss.get('vectorString', 'N/A')
-        elif 'cvssMetricV30' in metrics:
-            metric = metrics['cvssMetricV30'][0]
-            if 'cvssData' in metric:
-                cvss = metric['cvssData']
-                severity['score'] = cvss.get('baseScore', 'N/A')
-                severity['severity'] = metric.get('baseSeverity', 'UNKNOWN')
-                severity['vector'] = cvss.get('vectorString', 'N/A')
-        elif 'cvssMetricV2' in metrics:
-            metric = metrics['cvssMetricV2'][0]
-            severity['score'] = metric.get('baseScore', 'N/A')
-            severity['severity'] = metric.get('severity', 'UNKNOWN')
-        
-        return severity
+        return NVDAPI._extract_severity(cve_data.get('metrics', {}))
 
     def get_cves_for_site(self, technologies: List[Tuple[str, str]]) -> Dict[str, List[Dict]]:
-        results = {}
-
-        for tech, version in technologies:
-            print(f"  🔍 Buscando CVEs para {tech} {version}...")
-            cves = self.search_cves_by_technology(tech, version, max_results=50)
-            results[f"{tech} {version}"] = {
-                'count': len(cves),
-                'cves': cves
-            }
-
+        results = self.search_cves_for_technologies(technologies, max_results_per_tech=50)
         return results
 
     def get_statistics(self) -> Dict:
