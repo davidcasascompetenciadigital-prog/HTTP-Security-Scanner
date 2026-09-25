@@ -10,7 +10,10 @@ Licencia: CC BY-NC 4.0
 import os
 import json
 import lzma
+import time
+import hashlib
 import requests
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -24,11 +27,10 @@ try:
     IJSON_AVAILABLE = True
 except ImportError:
     IJSON_AVAILABLE = False
-    print("⚠️  ijson no está instalado. Instalando...")
-    import subprocess
-    subprocess.check_call(['pip', 'install', 'ijson'])
-    import ijson
-    IJSON_AVAILABLE = True
+    print("❌ Falta la librería 'ijson', necesaria para leer la base de datos de CVEs.")
+    print("   Instálala con:  pip install -r requeriments.txt")
+    print("   (o:  python3 -m pip install ijson)")
+    sys.exit(1)
 
 
 class LocalCVEDatabase:
@@ -38,6 +40,10 @@ class LocalCVEDatabase:
     # Ojo: el asset se llama 'CVE-all.json.xz' con 'all' en minúscula
     ALL_CVES_FILE = "CVE-all.json.xz"
     METADATA_URL = "https://api.github.com/repos/fkie-cad/nvd-json-data-feeds/releases/latest"
+    # SHA-256 y tamaño los publica upstream en <asset>.meta
+    META_FILE = "CVE-all.meta"
+    #: La API de GitHub permite 60 peticiones/hora sin token: se cachea.
+    VERSION_CACHE_SECONDS = 300
 
     def __init__(self, cache_dir: str = "./cve_cache"):
         self.cache_dir = Path(cache_dir)
@@ -47,8 +53,13 @@ class LocalCVEDatabase:
         self.metadata_file = self.cache_dir / "metadata.json"
         self.last_update = None
         self.version = None
-        self.total_cves = 0
+        self.total_cves = None
+        self.expected_sha256 = None
+        self.expected_xz_size = None
+        self.last_modified_date = None
         self.is_loaded = False
+        self._version_cache = None
+        self._version_cache_at = 0.0
 
         self._load_metadata()
 
@@ -60,8 +71,11 @@ class LocalCVEDatabase:
                     self.version = data.get('version')
                     if data.get('last_update'):
                         self.last_update = datetime.fromisoformat(data.get('last_update'))
-                    self.total_cves = data.get('cves_count', 0)
-            except:
+                    self.total_cves = data.get('cves_count')
+                    self.expected_sha256 = data.get('expected_sha256')
+                    self.expected_xz_size = data.get('expected_xz_size')
+            except (OSError, ValueError, TypeError):
+                # Metadatos ausentes o corruptos: se reconstruyen al descargar.
                 pass
 
     def _save_metadata(self):
@@ -69,12 +83,51 @@ class LocalCVEDatabase:
             'version': self.version,
             'last_update': self.last_update.isoformat() if self.last_update else None,
             'file_size': self.cves_file.stat().st_size if self.cves_file.exists() else 0,
-            'cves_count': self.total_cves
+            'cves_count': self.total_cves,
+            'expected_sha256': self.expected_sha256,
+            'expected_xz_size': self.expected_xz_size,
+            'last_modified_date': self.last_modified_date
         }
-        with open(self.metadata_file, 'w') as f:
+        tmp = self.metadata_file.with_suffix('.json.tmp')
+        with open(tmp, 'w') as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, self.metadata_file)
 
-    def _get_latest_version_info(self) -> Tuple[str, str]:
+    def _fetch_feed_meta(self) -> Tuple[Optional[int], Optional[str]]:
+        """Lee xzSize y sha256 del .meta que publica upstream junto al feed.
+
+        Ojo: el sha256 corresponde al JSON DESCOMPRIMIDO (3,1 GB), no al .xz,
+        así que no se puede comprobar sin descomprimir. El xzSize sí.
+        """
+        try:
+            resp = requests.get(
+                f"{self.BASE_URL}{self.META_FILE}", timeout=15
+            )
+            resp.raise_for_status()
+            text = resp.text
+        except requests.RequestException:
+            return None, None
+
+        xz_size = sha256 = None
+        for line in text.splitlines():
+            key, _, value = line.partition(':')
+            value = value.strip()
+            if key.strip() == 'xzSize' and value.isdigit():
+                xz_size = int(value)
+            elif key.strip() == 'sha256':
+                sha256 = value
+            elif key.strip() == 'lastModifiedDate':
+                self.last_modified_date = value
+        return xz_size, sha256
+
+    def _get_latest_version_info(self) -> Tuple[Optional[str], Optional[str]]:
+        now = time.time()
+        if self._version_cache and now - self._version_cache_at < self.VERSION_CACHE_SECONDS:
+            return self._version_cache
+
+        self.last_modified_date = None
+        self.expected_xz_size, self.expected_sha256 = self._fetch_feed_meta()
+
         try:
             response = requests.get(self.METADATA_URL, timeout=10)
             response.raise_for_status()
@@ -85,10 +138,16 @@ class LocalCVEDatabase:
                 if asset.get('name') == self.ALL_CVES_FILE:
                     download_url = asset.get('browser_download_url')
                     break
-            return version, download_url
-        except Exception as e:
+            if download_url is None:
+                download_url = f"{self.BASE_URL}{self.ALL_CVES_FILE}"
+        except (requests.RequestException, ValueError) as e:
             print(f"⚠️  Error obteniendo versión: {e}")
-            return None, None
+            # Sin metadatos de la API seguimos con la URL estable 'latest'.
+            return None, f"{self.BASE_URL}{self.ALL_CVES_FILE}"
+
+        self._version_cache = (version, download_url)
+        self._version_cache_at = now
+        return self._version_cache
 
     def check_update_needed(self) -> Tuple[bool, str]:
         latest_version, download_url = self._get_latest_version_info()
@@ -102,6 +161,46 @@ class LocalCVEDatabase:
             return True, "Archivo local no encontrado"
         return False, f"Versión actualizada ({self.version})"
 
+    def verify_integrity(self) -> bool:
+        """Comprueba el SHA-256 del feed descomprimido frente al publicado
+        por upstream. Descomprime ~3 GB, así que tarda del orden de un minuto.
+        """
+        if not self.cves_file.exists():
+            print("❌ No hay base de datos local que verificar.")
+            return False
+        if not self.expected_sha256:
+            resp = requests.get(
+                f"{self.BASE_URL}{self.META_FILE}", timeout=15
+            )
+            if resp.ok:
+                for line in resp.text.splitlines():
+                    key, _, value = line.partition(':')
+                    if key.strip() == 'sha256':
+                        self.expected_sha256 = value.strip()
+        if not self.expected_sha256:
+            print("❌ Upstream no publica un sha256 con el que comparar.")
+            return False
+
+        print("🔍 Verificando SHA-256 (descomprime el feed, puede tardar ~1 min)...")
+        digest = hashlib.sha256()
+        try:
+            with lzma.open(self.cves_file, 'rb') as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b''):
+                    digest.update(chunk)
+        except (lzma.LZMAError, OSError) as e:
+            print(f"❌ Archivo ilegible o corrupto: {e}")
+            return False
+
+        real = digest.hexdigest()
+        if real == self.expected_sha256:
+            print("✅ Integridad correcta: SHA-256 coincide con el publicado.")
+            return True
+        print(f"❌ SHA-256 incorrecto.")
+        print(f"   esperado: {self.expected_sha256}")
+        print(f"   obtenido: {real}")
+        print("   Borra cve_cache/ y vuelve a descargar.")
+        return False
+
     def download_cves(self, force: bool = False) -> bool:
         if not force and self.cves_file.exists():
             needs_update, _ = self.check_update_needed()
@@ -112,6 +211,7 @@ class LocalCVEDatabase:
         print(f"📥 Descargando base de datos de CVEs...")
         print(f"   (esto puede tomar varios minutos)")
 
+        part_file = self.cves_file.with_suffix(self.cves_file.suffix + '.part')
         try:
             latest_version, download_url = self._get_latest_version_info()
             if not download_url:
@@ -123,25 +223,42 @@ class LocalCVEDatabase:
             total_size = int(response.headers.get('content-length', 0))
             downloaded = 0
 
-            with open(self.cves_file, 'wb') as f:
+            with open(part_file, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=8192):
+                    if not chunk:
+                        continue
                     f.write(chunk)
                     downloaded += len(chunk)
                     if total_size > 0:
                         percent = (downloaded / total_size) * 100
                         print(f"\r   Progreso: {percent:.1f}%", end='')
-
             print(f"\n✅ Descarga completada")
+
+            # Descarga truncada: no se publica el fichero a medias.
+            if self.expected_xz_size and downloaded != self.expected_xz_size:
+                part_file.unlink(missing_ok=True)
+                print(f"❌ Descarga incompleta: {downloaded} bytes, "
+                      f"esperados {self.expected_xz_size}")
+                return False
+
+            # Renombrado atómico: hasta aquí el .part no se usa para nada.
+            os.replace(part_file, self.cves_file)
 
             self.version = latest_version
             self.last_update = datetime.now()
-            self.total_cves = 381325
+            # Contar exigiría una pasada completa sobre 3,1 GB: mejor no
+            # inventar la cifra.
+            self.total_cves = None
             self._save_metadata()
 
-            print(f"✅ Base de datos descargada. Total CVEs: ~{self.total_cves}")
+            if self.expected_sha256:
+                print(f"ℹ️  SHA-256 esperado: {self.expected_sha256}")
+                print(f"   Verifícalo cuando quieras con la opción de "
+                      f"integridad del gestor de la base de datos.")
             return True
 
         except Exception as e:
+            part_file.unlink(missing_ok=True)
             print(f"\n❌ Error descargando CVEs: {e}")
             return False
 
@@ -152,9 +269,10 @@ class LocalCVEDatabase:
 
         self.is_loaded = True
         size_mb = self.cves_file.stat().st_size / (1024 * 1024)
+        count = f"~{self.total_cves}" if self.total_cves else "sin contar"
         print(f"✅ Base de datos disponible: {self.cves_file}")
         print(f"   Tamaño: {size_mb:.1f} MB")
-        print(f"   CVEs en base de datos: ~{self.total_cves}")
+        print(f"   CVEs en base de datos: {count}")
         return True
 
     def _parse_version(self, version_str: str) -> Tuple[int, ...]:
@@ -180,7 +298,7 @@ class LocalCVEDatabase:
                     else:
                         parts.append(0)
             return tuple(parts)
-        except:
+        except (AttributeError, TypeError, ValueError):
             return ()
 
     def _version_in_range(self, version: str, start: str, end: str) -> bool:
@@ -356,9 +474,12 @@ class LocalCVEDatabase:
         return results
 
     def get_statistics(self) -> Dict:
+        disponible = self.cves_file.exists()
         return {
-            'status': 'Disponible',
-            'total_cves': self.total_cves,
+            'status': 'Disponible' if disponible else 'No cargada',
+            'total_cves': self.total_cves if disponible else None,
             'version': self.version,
-            'last_update': self.last_update.isoformat() if self.last_update else 'Unknown'
+            'last_update': self.last_update.isoformat() if self.last_update else 'Unknown',
+            'file_size_mb': round(self.cves_file.stat().st_size / (1024 * 1024), 1)
+                            if disponible else None
         }

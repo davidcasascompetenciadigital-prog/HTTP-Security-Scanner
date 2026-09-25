@@ -12,14 +12,12 @@ import requests
 import json
 import time
 import re
-import subprocess
+import sys
 from urllib.parse import urlparse, parse_qs
 from datetime import datetime
 from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 from requests.structures import CaseInsensitiveDict
-import warnings
-warnings.filterwarnings('ignore')
 
 # Importar módulos de CVEs
 from cve_analyzer import LocalCVEDatabase
@@ -37,21 +35,41 @@ try:
     RICH_AVAILABLE = True
 except ImportError:
     RICH_AVAILABLE = False
-    print("⚠️  Rich no está instalado. Instalando...")
-    subprocess.check_call(['pip', 'install', 'rich'])
-    from rich.console import Console
-    from rich.table import Table
-    from rich.panel import Panel
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
-    from rich.prompt import Prompt, Confirm
-    from rich import box
-    RICH_AVAILABLE = True
+    print("❌ Falta la librería 'rich', necesaria para la interfaz.")
+    print("   Instálala con:  pip install -r requeriments.txt")
+    print("   (o:  python3 -m pip install rich requests ijson)")
+    sys.exit(1)
 
 console = Console()
 
 
 class WebSecurityAnalyzer:
     """Analizador web completo con soporte para CVEs"""
+
+    #: Colores de rich para cada severidad devuelta por la NVD.
+    SEVERITY_COLORS = {
+        "CRÍTICA": "bright_red",
+        "CRITICAL": "bright_red",
+        "ALTA": "red",
+        "HIGH": "red",
+        "MEDIA": "yellow",
+        "MEDIUM": "yellow",
+        "BAJA": "cyan",
+        "LOW": "cyan",
+        "INFO": "dim",
+        "DESCONOCIDA": "dim",
+        "UNKNOWN": "dim",
+    }
+
+    @staticmethod
+    def severity_color(severity: str) -> str:
+        """Devuelve el color de rich para una severidad, sin fallar ante
+        valores inesperados o None."""
+        if not severity:
+            return "dim"
+        return WebSecurityAnalyzer.SEVERITY_COLORS.get(
+            str(severity).strip().upper(), "white"
+        )
 
     def __init__(self):
         self.url = None
@@ -182,7 +200,7 @@ class WebSecurityAnalyzer:
 [bold]Repositorio:[/bold] https://github.com/fkie-cad/nvd-json-data-feeds
 [bold]Descripción:[/bold] Reconstrucción comunitaria de los feeds JSON de NVD
 [bold]Actualización:[/bold] Diaria (00:00 UTC)
-[bold]Total CVEs:[/bold] ~381,000+
+[bold]Total CVEs:[/bold] ~398.000
 [bold]Formato:[/bold] NVD JSON 2.0
 [bold]Licencia:[/bold] Open Source
 [bold]Ventajas:[/bold]
@@ -218,16 +236,18 @@ https://nvd.nist.gov/[/italic dim]
 
         # Mostrar estadísticas si está disponible
         stats = self.cve_db.get_statistics()
-        if stats.get('status') != 'No cargada' and stats.get('total_cves', 0) > 0:
+        if stats.get('status') == 'Disponible':
             stats_table = Table(box=box.SIMPLE)
             stats_table.add_column("Métrica", style="bold yellow")
             stats_table.add_column("Valor", style="white")
 
-            stats_table.add_row("Total CVEs", str(stats['total_cves']))
+            total = stats.get('total_cves')
+            shown = f"{total:,}".replace(",", ".") if total else "sin contar"
+            stats_table.add_row("Total CVEs", shown)
             if 'severity_count' in stats:
                 for severity, count in stats['severity_count'].items():
                     if count > 0:
-                        color = "red" if severity == "CRITICAL" else "yellow" if severity == "HIGH" else "blue"
+                        color = self.severity_color(severity)
                         stats_table.add_row(f"  {severity}", f"[{color}]{count}[/{color}]")
 
             console.print(Panel(stats_table, title="[bold]📊 ESTADÍSTICAS[/bold]", border_style="green"))
@@ -235,9 +255,10 @@ https://nvd.nist.gov/[/italic dim]
         # Opciones
         console.print("\n[bold]Opciones:[/bold]")
         console.print("  1. 📥 Descargar/Actualizar base de datos")
-        console.print("  2. ↩️  Volver al menú principal")
+        console.print("  2. 🔐 Verificar integridad (SHA-256)")
+        console.print("  3. ↩️  Volver al menú principal")
 
-        choice = Prompt.ask("\n[bold cyan]Selecciona una opción[/bold cyan]", choices=["1", "2"])
+        choice = Prompt.ask("\n[bold cyan]Selecciona una opción[/bold cyan]", choices=["1", "2", "3"])
 
         if choice == "1":
             if self.cve_db.download_cves(force=True):
@@ -245,9 +266,16 @@ https://nvd.nist.gov/[/italic dim]
                 console.print("[bold green]✅ Base de datos actualizada correctamente[/bold green]")
             else:
                 console.print("[bold red]❌ Error actualizando base de datos[/bold red]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
         elif choice == "2":
+            if self.cve_db.verify_integrity():
+                console.print("[bold green]✅ Integridad verificada[/bold green]")
+            else:
+                console.print("[bold red]❌ La base de datos no supera la verificación[/bold red]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
+
+        elif choice == "3":
             return
 
     # =====================================================
@@ -609,7 +637,7 @@ https://nvd.nist.gov/[/italic dim]
         """Busca CVEs usando FKIE-CAD (offline)"""
         if not self.technologies:
             console.print("\n[yellow]⚠️  No hay tecnologías detectadas. Analiza una URL primero.[/yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         console.clear()
@@ -630,7 +658,7 @@ https://nvd.nist.gov/[/italic dim]
                 self.cve_db_loaded = True
             else:
                 console.print("[red]   ❌ Error cargando base de datos de CVEs[/red]")
-                input("\n[dim]Presiona Enter para continuar...[/dim]")
+                console.input("\n[dim]Presiona Enter para continuar...[/dim]")
                 return
 
         # Una sola pasada sobre el feed para todas las tecnologías
@@ -654,7 +682,7 @@ https://nvd.nist.gov/[/italic dim]
         """Busca CVEs usando NVD API (online)"""
         if not self.technologies:
             console.print("\n[yellow]⚠️  No hay tecnologías detectadas. Analiza una URL primero.[/yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         console.clear()
@@ -689,8 +717,8 @@ https://nvd.nist.gov/[/italic dim]
         if Confirm.ask("\n[bold]¿Quieres ver los CVEs encontrados?[/bold]"):
             self.show_cves_detail()
         else:
-            console.print("\n[dim]Puedes verlos más tarde con la opción 9 del menú principal[/dim]")
-            input("\n[dim]Presiona Enter para volver al menú principal...[/dim]")
+            console.print("\n[dim]Puedes verlos más tarde con la opción 0 del menú principal[/dim]")
+            console.input("\n[dim]Presiona Enter para volver al menú principal...[/dim]")
             
     # función para agregar la API de NVD
     def configure_nvd_api(self):
@@ -726,12 +754,12 @@ https://nvd.nist.gov/[/italic dim]
                 console.print("[bold green]✅ API Key configurada correctamente[/bold green]")
             else:
                 console.print("[red]❌ API Key inválida. Debe tener al menos 10 caracteres.[/red]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             
         elif choice == "2":
             self.nvd_api.set_api_key(None)
             console.print("[bold yellow]🗑️  API Key eliminada[/bold yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             
         elif choice == "3":
             return
@@ -749,7 +777,7 @@ https://nvd.nist.gov/[/italic dim]
         
         if not self.response:
             console.print("[red]❌ No hay contenido para analizar. Analiza una URL primero.[/red]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
         
         from web_analyzer_advanced import WebAnalyzerAdvanced
@@ -938,7 +966,7 @@ https://nvd.nist.gov/[/italic dim]
             console.print(Panel(security_table, border_style="red"))
             console.print()
         
-        input("\n[dim]Presiona Enter para continuar...[/dim]")   
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")   
    
     # =====================================================
     # VISUALIZACIÓN DE RESULTADOS
@@ -987,7 +1015,7 @@ https://nvd.nist.gov/[/italic dim]
 
             for vuln in self.vulnerabilities[:5]:
                 severity = vuln['severity']
-                color = "red" if severity == "Crítica" else "yellow" if severity == "Alta" else "blue"
+                color = self.severity_color(severity)
                 vuln_table.add_row(
                     f"[{color}]{severity}[/{color}]",
                     vuln['type'],
@@ -1060,7 +1088,7 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.classified_headers:
             console.print("[yellow]No hay cabeceras para mostrar[/yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         for category, headers in self.classified_headers.items():
@@ -1077,7 +1105,7 @@ https://nvd.nist.gov/[/italic dim]
                 console.print(table)
                 console.print()
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
     def get_header_significance(self, key, value):
         key_lower = key.lower()
@@ -1134,7 +1162,7 @@ https://nvd.nist.gov/[/italic dim]
                 border_style=color
             ))
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
     def show_vulnerabilities_detail(self):
         console.clear()
@@ -1143,12 +1171,12 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.vulnerabilities:
             console.print("[bold green]✅ No se encontraron vulnerabilidades[/bold green]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         for i, vuln in enumerate(self.vulnerabilities, 1):
             severity = vuln['severity']
-            color = "red" if severity == "Crítica" else "yellow" if severity == "Alta" else "blue"
+            color = self.severity_color(severity)
 
             vuln_panel = Panel(
                 f"""[bold]Tipo:[/bold] {vuln['type']}
@@ -1161,7 +1189,7 @@ https://nvd.nist.gov/[/italic dim]
             console.print(vuln_panel)
             console.print()
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
     def show_cves_detail(self):
         """Muestra CVEs encontrados con paginación mejorada"""
@@ -1175,14 +1203,14 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.cve_results:
             console.print("[yellow]No hay CVEs para mostrar. Busca CVEs primero (opción 5 o 6).[/yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         total_cves = sum(data['count'] for data in self.cve_results.values())
 
         if total_cves == 0:
             console.print("[bold green]✅ No se encontraron CVEs para las tecnologías detectadas[/bold green]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         # Mostrar resumen de tecnologías
@@ -1332,7 +1360,7 @@ https://nvd.nist.gov/[/italic dim]
                     console.print("[red]❌ Opción no válida[/red]")
                     time.sleep(0.5)
 
-        input("\n[dim]Presiona Enter para volver al menú principal...[/dim]")
+        console.input("\n[dim]Presiona Enter para volver al menú principal...[/dim]")
 
     def show_cookies_detail(self):
         console.clear()
@@ -1341,7 +1369,7 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.response or not self.response.cookies:
             console.print("[yellow]No se encontraron cookies[/yellow]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         cookie_table = Table(box=box.ROUNDED)
@@ -1385,7 +1413,7 @@ https://nvd.nist.gov/[/italic dim]
             """
             console.print(Panel(summary, border_style="yellow"))
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
     def show_content_stats(self):
         console.clear()
@@ -1394,7 +1422,7 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.response:
             console.print("[red]No hay contenido para analizar[/red]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         content = self.response.text
@@ -1435,7 +1463,7 @@ https://nvd.nist.gov/[/italic dim]
 
         console.print(stat_table)
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
     def generate_report(self):
         console.clear()
@@ -1444,7 +1472,7 @@ https://nvd.nist.gov/[/italic dim]
 
         if not self.url:
             console.print("[red]❌ No hay análisis realizado. Analiza una URL primero.[/red]")
-            input("\n[dim]Presiona Enter para continuar...[/dim]")
+            console.input("\n[dim]Presiona Enter para continuar...[/dim]")
             return
 
         report = {
@@ -1481,7 +1509,7 @@ https://nvd.nist.gov/[/italic dim]
             border_style="green"
         ))
 
-        input("\n[dim]Presiona Enter para continuar...[/dim]")
+        console.input("\n[dim]Presiona Enter para continuar...[/dim]")
 
 
 def main():

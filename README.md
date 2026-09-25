@@ -28,7 +28,7 @@ Definición: "Vulnerabilidades y exposiciones comunes Common Vulnerabilities and
 - 🖥️ **Interfaz visual interactiva** con colores y tablas usando Rich
 - 📝 **Generación de reportes** en formato JSON
 - 🔍 **Detección de tecnologías** (nginx, Apache, PHP, WordPress, Odoo, Django, Node.js)
-- 📌 **Búsqueda de CVEs offline** con base de datos FKIE-CAD (381,325 CVEs)
+- 📌 **Búsqueda de CVEs offline** con base de datos FKIE-CAD (~398.000 CVEs, se actualiza a diario)
 - 📄 **Paginación de resultados** para CVEs
 - 📚 **Origen de datos** FKIE-CAD (Fraunhofer FKIE Cyber Analysis & Defense)
 
@@ -74,26 +74,27 @@ source websecurity/bin/activate
 venv\Scripts\activate
 
 # 4. Instalar dependencias
-pip install -r requirements.txt
+pip install -r requeriments.txt
 
 # 5. Ejecutar el analizador
-python web_analyzer_visual.py
+python web_analyzer_pro.py
 
 ### Instalación sin entorno virtual (global)
 ```bash
 # Instalar dependencias globalmente
-pip install rich requests
+pip install rich requests ijson
 Alternativamente, puedes "pip install -r requeriments.txt"
 
 # Ejecutar
-python web_analyzer_visual.py
+python web_analyzer_pro.py
 
 Dependencias
 
     requests >= 2.28.0
     rich >= 13.0.0
+    ijson >= 3.2.0
 
-$ python web_analyzer_visual.py
+$ python web_analyzer_pro.py
 
 ╔══════════════════════════════════════════════════════════════════════════════╗
 ║                                                                              ║
@@ -196,7 +197,7 @@ Fuente: FKIE-CAD (Fraunhofer FKIE Cyber Analysis & Defense)
 Repositorio: https://github.com/fkie-cad/nvd-json-data-feeds
 Descripción: Reconstrucción comunitaria de los feeds JSON de NVD
 Actualización: Diaria (00:00 UTC)
-Total CVEs: ~381,000+
+Total CVEs: ~398.000
 Formato: NVD JSON 2.0
 Licencia: Open Source
 Ventajas:
